@@ -163,6 +163,7 @@ jobs:
       github.ref == format('refs/heads/{0}', needs.validate-parameters.outputs.develop_branch)
 
     runs-on: ubuntu-latest
+    timeout-minutes: 1440
 
     steps:
 
@@ -209,3 +210,46 @@ jobs:
           else
             echo "Auto-merge could not be enabled. PR #$PR_NUMBER remains open for manual review/merge."
           fi
+
+      - name: Wait Until PR Is Merged or Closed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+        run: |
+          MAX_WAIT_SECONDS=86400
+          POLL_INTERVAL_SECONDS=180
+          ELAPSED_SECONDS=0
+
+          while [ "$ELAPSED_SECONDS" -lt "$MAX_WAIT_SECONDS" ]; do
+            PR_STATE=$(gh pr view "$PR_NUMBER" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json state \
+              --jq '.state')
+
+            MERGED_AT=$(gh pr view "$PR_NUMBER" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json mergedAt \
+              --jq '.mergedAt')
+
+            if [ "$MERGED_AT" != "null" ] && [ -n "$MERGED_AT" ]; then
+              echo "PR #$PR_NUMBER merged at $MERGED_AT."
+              exit 0
+            fi
+
+            if [ "$PR_STATE" = "CLOSED" ]; then
+              echo "PR #$PR_NUMBER closed without merge."
+              exit 0
+            fi
+
+            if [ "$PR_STATE" != "OPEN" ]; then
+              echo "Unexpected PR state: $PR_STATE"
+              exit 1
+            fi
+
+            echo "PR #$PR_NUMBER is still open. Waiting..."
+            sleep "$POLL_INTERVAL_SECONDS"
+            ELAPSED_SECONDS=$((ELAPSED_SECONDS + POLL_INTERVAL_SECONDS))
+          done
+
+          echo "Timed out waiting for PR #$PR_NUMBER to be merged or closed."
+          exit 1
