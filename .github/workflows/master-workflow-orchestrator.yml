@@ -1,0 +1,255 @@
+name: Master Workflow Orchestrator
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+
+  validate-parameters:
+
+    runs-on: ubuntu-latest
+
+    outputs:
+      runner_name: ${{ steps.params.outputs.runner_name }}
+      main_branch: ${{ steps.params.outputs.main_branch }}
+      develop_branch: ${{ steps.params.outputs.develop_branch }}
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq \
+          https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Read Parameters
+        id: params
+        run: |
+
+          PARAM_FILE="parameters/master-workflow-orchestrator-parameters.yml"
+
+          MAIN_BRANCH=$(yq '.main_branch_name' $PARAM_FILE)
+          DEVELOP_BRANCH=$(yq '.develop_branch_name' $PARAM_FILE)
+          MAIN_REQ=$(yq '.main_branch_must_exist' $PARAM_FILE)
+          DEV_REQ=$(yq '.develop_branch_must_exist' $PARAM_FILE)
+          RUNNER=$(yq '.runner_name' $PARAM_FILE)
+          EPOCH=$(yq '.epoch_time_to_trigger_master_workflow' $PARAM_FILE)
+          ITER=$(yq '.allowed_iteration' $PARAM_FILE)
+
+          echo "runner_name=$RUNNER" >> $GITHUB_OUTPUT
+          echo "main_branch=$MAIN_BRANCH" >> $GITHUB_OUTPUT
+          echo "develop_branch=$DEVELOP_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Validate Main Branch
+        run: |
+
+          MAIN_BRANCH=$(yq '.main_branch_name' parameters/master-workflow-orchestrator-parameters.yml)
+
+          if [[ "$MAIN_BRANCH" =~ [[:space:]] ]]; then
+            echo "Main branch contains spaces"
+            exit 1
+          fi
+
+      - name: Validate Develop Branch
+        run: |
+
+          DEVELOP_BRANCH=$(yq '.develop_branch_name' parameters/master-workflow-orchestrator-parameters.yml)
+
+          if [[ "$DEVELOP_BRANCH" =~ [[:space:]] ]]; then
+            echo "Develop branch contains spaces"
+            exit 1
+          fi
+
+      - name: Validate Runner
+        run: |
+
+          RUNNER=$(yq '.runner_name' parameters/master-workflow-orchestrator-parameters.yml)
+
+          if [[ "$RUNNER" =~ [[:space:]] ]]; then
+            echo "Runner name contains spaces"
+            exit 1
+          fi
+
+      - name: Validate Epoch
+        run: |
+
+          PARAM_FILE="parameters/master-workflow-orchestrator-parameters.yml"
+
+          EPOCH=$(yq '.epoch_time_to_trigger_master_workflow' $PARAM_FILE)
+
+          NOW=$(date +%s)
+
+          if [ "$EPOCH" -le "$NOW" ]; then
+             echo "Epoch is not in future"
+             exit 1
+          fi
+
+      - name: Validate Allowed Iteration
+        run: |
+
+          ITER=$(yq '.allowed_iteration' parameters/master-workflow-orchestrator-parameters.yml)
+
+          [[ "$ITER" =~ ^[0-9]+$ ]] || exit 1
+
+      - name: Verify Main Branch Exists
+        run: |
+
+          MAIN=$(yq '.main_branch_name' parameters/master-workflow-orchestrator-parameters.yml)
+
+          git ls-remote --heads origin "$MAIN" | grep "$MAIN" \
+          || exit 1
+
+      - name: Verify Develop Branch Exists
+        run: |
+
+          DEV=$(yq '.develop_branch_name' parameters/master-workflow-orchestrator-parameters.yml)
+
+          git ls-remote --heads origin "$DEV" | grep "$DEV" \
+          || exit 1
+
+  runner-connectivity-test:
+
+    needs: validate-parameters
+
+    uses: shailunixpro-mern/Github-Action-to-Runner-Test-Reusable-Workflow/.github/workflows/github-runner-connectivity-test.yml@main
+
+    with:
+      runner_name: ${{ needs.validate-parameters.outputs.runner_name }}
+
+    secrets: inherit
+
+  display-results:
+
+    needs:
+      - runner-connectivity-test
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Display Workflow Result
+
+        run: |
+
+          RESULT="${{ needs.runner-connectivity-test.outputs.connectivity_result }}"
+
+          echo "=================================================="
+          echo "Variable Name : connectivity_result"
+          echo "Returned Value: $RESULT"
+          echo "=================================================="
+
+          if [ "$RESULT" = "Success" ]; then
+             echo "Runner connectivity test PASSED"
+          else
+             echo "Runner connectivity test FAILED"
+             exit 1
+          fi
+
+  merge-develop-into-main:
+
+    needs:
+      - validate-parameters
+      - display-results
+
+    if: |
+      success() &&
+      github.ref == format('refs/heads/{0}', needs.validate-parameters.outputs.develop_branch)
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 1440
+
+    steps:
+
+      - name: Create or Reuse PR from develop to main
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAIN_BRANCH: ${{ needs.validate-parameters.outputs.main_branch }}
+          DEVELOP_BRANCH: ${{ needs.validate-parameters.outputs.develop_branch }}
+        run: |
+          EXISTING_PR_NUMBER=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --base "$MAIN_BRANCH" \
+            --head "$DEVELOP_BRANCH" \
+            --state open \
+            --json number \
+            --jq '.[0].number')
+
+          if [ -n "$EXISTING_PR_NUMBER" ]; then
+            echo "Open PR already exists: #$EXISTING_PR_NUMBER"
+            echo "pr_number=$EXISTING_PR_NUMBER" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PR_URL=$(gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base "$MAIN_BRANCH" \
+            --head "$DEVELOP_BRANCH" \
+            --title "Auto-merge: $DEVELOP_BRANCH -> $MAIN_BRANCH" \
+            --body "Automated PR created after successful workflow run on $DEVELOP_BRANCH.")
+
+          PR_NUMBER=$(echo "$PR_URL" | awk -F/ '{print $NF}')
+
+          echo "Created PR: $PR_URL"
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Enable Auto-Merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+        run: |
+          if gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --merge --auto; then
+            echo "Auto-merge enabled for PR #$PR_NUMBER"
+          else
+            echo "Auto-merge could not be enabled. PR #$PR_NUMBER remains open for manual review/merge."
+          fi
+
+      - name: Wait Until PR Is Merged or Closed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+        run: |
+          MAX_WAIT_SECONDS=86400
+          POLL_INTERVAL_SECONDS=180
+          ELAPSED_SECONDS=0
+
+          while [ "$ELAPSED_SECONDS" -lt "$MAX_WAIT_SECONDS" ]; do
+            PR_STATE=$(gh pr view "$PR_NUMBER" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json state \
+              --jq '.state')
+
+            MERGED_AT=$(gh pr view "$PR_NUMBER" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json mergedAt \
+              --jq '.mergedAt')
+
+            if [ "$MERGED_AT" != "null" ] && [ -n "$MERGED_AT" ]; then
+              echo "PR #$PR_NUMBER merged at $MERGED_AT."
+              exit 0
+            fi
+
+            if [ "$PR_STATE" = "CLOSED" ]; then
+              echo "PR #$PR_NUMBER closed without merge."
+              exit 0
+            fi
+
+            if [ "$PR_STATE" != "OPEN" ]; then
+              echo "Unexpected PR state: $PR_STATE"
+              exit 1
+            fi
+
+            echo "PR #$PR_NUMBER is still open. Waiting..."
+            sleep "$POLL_INTERVAL_SECONDS"
+            ELAPSED_SECONDS=$((ELAPSED_SECONDS + POLL_INTERVAL_SECONDS))
+          done
+
+          echo "Timed out waiting for PR #$PR_NUMBER to be merged or closed."
+          exit 1

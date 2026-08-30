@@ -1,0 +1,23 @@
+#====================================================
+# Master Workflow Configuration Parameters
+#====================================================
+
+main_branch_name: main
+
+develop_branch_name: develop
+
+main_branch_must_exist: true
+
+develop_branch_must_exist: true
+
+runner_name: BamAgentSrvLinux
+
+epoch_time_to_trigger_master_workflow: 1893456000
+
+allowed_iteration: 1
+
+#====================================================
+# Reusable Workflow Variables
+#====================================================
+
+github_action_to_runner_test_reusable_workflow_parameter_runner_name: BamAgentSrvLinux
